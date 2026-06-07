@@ -1,0 +1,472 @@
+# core/trading_engine.py
+# ============================================================
+# THE MASTER BRAIN
+# Orchestrates all components.
+# This is where everything comes together.
+# The engine that runs 24/7.
+# ============================================================
+
+import asyncio
+import logging
+import signal
+import sys
+from datetime import datetime
+from typing import Dict, List, Optional
+
+from binance import AsyncClient
+
+from config.settings import config
+from data.data_collector import DataCollector
+from signals.signal_engine import SignalEngine
+from signals.indicators import Indicators
+from risk.risk_manager import RiskManager
+from execution.executor import ExecutionEngine
+from analytics.performance_engine import PerformanceEngine
+from models.data_models import (
+    Side, TradeStatus, RegimeState
+)
+
+logger = logging.getLogger(__name__)
+
+
+class TradingEngine:
+    """
+    The complete algorithmic trading system.
+
+    Orchestration flow per symbol per cycle:
+    1. Collect market data
+    2. Generate composite signal
+    3. Validate risk constraints
+    4. Calculate position size (Kelly)
+    5. Execute trade
+    6. Monitor open positions
+    7. Record and analyze
+    """
+
+    def __init__(self):
+        self.is_running = False
+        self.current_capital = config.trading.STARTING_CAPITAL
+        self.cycle_count = 0
+        self.start_time = datetime.now()
+
+        # Components (initialized in start())
+        self.data_collector: Optional[DataCollector] = None
+        self.signal_engine: Optional[SignalEngine] = None
+        self.risk_manager: Optional[RiskManager] = None
+        self.executor: Optional[ExecutionEngine] = None
+        self.performance: Optional[PerformanceEngine] = None
+        self.client: Optional[AsyncClient] = None
+
+    async def start(self) -> None:
+        """
+        Initialize all components and start trading.
+        ALWAYS starts in paper mode first.
+        """
+        logger.info(
+            f"\n{'#'*60}\n"
+            f"# THE EMPIRE STARTS HERE\n"
+            f"# Mode: {'PAPER' if config.trading.PAPER_TRADING else 'LIVE'}\n"
+            f"# Capital: ${self.current_capital:.2f}\n"
+            f"# Time: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}\n"
+            f"{'#'*60}"
+        )
+
+        # ─── INITIALIZE CLIENT ────────────────────────────
+        self.client = await AsyncClient.create(
+            api_key=config.exchange.BINANCE_API_KEY,
+            api_secret=config.exchange.BINANCE_SECRET_KEY,
+            testnet=config.exchange.BINANCE_TESTNET
+        )
+
+        # ─── INITIALIZE ALL COMPONENTS ────────────────────
+        self.data_collector = DataCollector()
+        await self.data_collector.initialize()
+
+        self.signal_engine = SignalEngine()
+
+        self.risk_manager = RiskManager(
+            initial_capital=self.current_capital
+        )
+
+        self.executor = ExecutionEngine(
+            client=self.client,
+            paper_trading=config.trading.PAPER_TRADING
+        )
+
+        self.performance = PerformanceEngine()
+
+        # ─── VALIDATE SYSTEM BEFORE TRADING ───────────────
+        validation_passed = await self._validate_system()
+
+        if not validation_passed:
+            logger.error("❌ System validation failed. Not starting.")
+            await self.stop()
+            return
+
+        # ─── REGISTER SHUTDOWN HANDLERS ───────────────────
+        signal.signal(signal.SIGINT, self._handle_shutdown)
+        signal.signal(signal.SIGTERM, self._handle_shutdown)
+
+        # ─── START MAIN LOOP ──────────────────────────────
+        self.is_running = True
+        logger.info("✅ System validated. Starting main trading loop.")
+
+        await self._main_loop()
+
+    async def _main_loop(self) -> None:
+        """
+        Main trading loop.
+        Runs continuously analyzing markets and managing trades.
+
+        Cycle frequency: Every 60 seconds (1m bar close)
+        """
+        while self.is_running:
+            cycle_start = datetime.now()
+            self.cycle_count += 1
+
+            try:
+                # ─── STEP 1: PORTFOLIO STATE ──────────────
+                portfolio = self.risk_manager.get_portfolio_state(
+                    self.current_capital,
+                    list(self.executor.open_trades.values())
+                )
+
+                # ─── STEP 2: MONITOR OPEN TRADES ──────────
+                await self._monitor_open_trades()
+
+                # ─── STEP 3: CIRCUIT BREAKER CHECK ────────
+                if portfolio.is_circuit_breaker_active:
+                    logger.warning(
+                        f"⛔ Circuit breaker active. "
+                        f"Daily PnL: {portfolio.daily_pnl:.2%}"
+                    )
+                    await self._wait_for_next_cycle(60)
+                    continue
+
+                # ─── STEP 4: ANALYZE MARKETS ──────────────
+                for symbol in config.trading.PRIMARY_PAIRS:
+                    await self._process_symbol(symbol)
+
+                    # Small delay between symbols
+                    await asyncio.sleep(2)
+
+                # ─── STEP 5: PERIODIC REPORTS ─────────────
+                if self.cycle_count % 60 == 0:  # Every hour
+                    await self._hourly_review()
+
+                if self.cycle_count % (60 * 24 * 7) == 0:  # Weekly
+                    await self._weekly_review()
+
+                # ─── STEP 6: WAIT FOR NEXT CYCLE ──────────
+                cycle_duration = (datetime.now() - cycle_start).seconds
+                wait_time = max(60 - cycle_duration, 5)
+                await self._wait_for_next_cycle(wait_time)
+
+            except Exception as e:
+                logger.error(f"❌ Error in main loop: {e}", exc_info=True)
+                await asyncio.sleep(10)  # Brief pause on error
+
+    async def _process_symbol(self, symbol: str) -> None:
+        """
+        Complete analysis and trading cycle for one symbol.
+        """
+        try:
+            # ─── COLLECT DATA ─────────────────────────────
+            data_package = await self.data_collector.get_complete_data_package(
+                symbol
+            )
+
+            multi_tf = data_package['multi_tf']
+            order_book = data_package['order_book']
+            trades_df = data_package['trades']
+
+            if not multi_tf or config.trading.ETF not in multi_tf:
+                logger.warning(f"No data for {symbol}")
+                return
+
+            primary_data = multi_tf[config.trading.ETF]
+
+            # Get secondary data for cointegration signal
+            secondary_symbol = {
+                'BTCUSDT': 'ETHUSDT',
+                'ETHUSDT': 'BTCUSDT',
+                'SOLUSDT': 'ETHUSDT',
+            }.get(symbol)
+
+            secondary_data = (
+                multi_tf.get(secondary_symbol)
+                if secondary_symbol
+                else None
+            )
+
+            # ─── GENERATE SIGNAL ──────────────────────────
+            signal = self.signal_engine.generate_composite_signal(
+                symbol=symbol,
+                primary_data=primary_data,
+                multi_tf_data=multi_tf,
+                order_book=order_book,
+                trades_df=trades_df,
+                secondary_data=secondary_data
+            )
+
+            # ─── NO TRADE ZONE ────────────────────────────
+            if not signal.should_trade:
+                logger.debug(
+                    f"⏸️ {symbol}: No trade signal "
+                    f"(score: {signal.composite_score:+.3f})"
+                )
+                return
+
+            # ─── ALREADY IN THIS TRADE? ───────────────────
+            existing = [
+                t for t in self.executor.open_trades.values()
+                if t.symbol == symbol
+            ]
+            if existing:
+                logger.debug(f"Already in {symbol} trade, skipping")
+                return
+
+            # ─── GET CURRENT ATR ──────────────────────────
+            atr_values = Indicators.atr(
+                primary_data.highs,
+                primary_data.lows,
+                primary_data.closes,
+                config.trading.ATR_PERIOD
+            )
+            current_atr = float(atr_values[-1])
+            current_price = primary_data.current_price
+
+            # ─── CALCULATE POSITION SIZE ──────────────────
+            position_size = self.risk_manager.calculate_position_size(
+                signal=signal,
+                current_capital=self.current_capital,
+                current_price=current_price,
+                atr=current_atr,
+                open_trades=list(self.executor.open_trades.values())
+            )
+
+            if position_size is None:
+                logger.warning(f"Position size calculation failed for {symbol}")
+                return
+
+            # ─── VALIDATE TRADE ───────────────────────────
+            is_approved, reason = self.risk_manager.validate_trade(
+                signal=signal,
+                position_size=position_size,
+                open_trades=list(self.executor.open_trades.values()),
+                current_capital=self.current_capital
+            )
+
+            if not is_approved:
+                logger.info(f"🚫 Trade rejected: {reason}")
+                return
+
+            # ─── EXECUTE TRADE ────────────────────────────
+            trade = await self.executor.execute_entry(
+                signal=signal,
+                position_size=position_size,
+                current_price=current_price
+            )
+
+            if trade:
+                logger.info(
+                    f"🚀 New trade opened: {trade.trade_id} | "
+                    f"{symbol} {signal.direction.value}"
+                )
+
+        except Exception as e:
+            logger.error(
+                f"Error processing {symbol}: {e}",
+                exc_info=True
+            )
+
+    async def _monitor_open_trades(self) -> None:
+        """Monitor all open trades for exit conditions"""
+        for trade_id, trade in list(self.executor.open_trades.items()):
+            try:
+                # Get current price
+                data = await self.data_collector.fetch_ohlcv(
+                    trade.symbol, config.trading.TICK, limit=20
+                )
+
+                current_price = data.current_price
+
+                atr_vals = Indicators.atr(
+                    data.highs, data.lows, data.closes
+                )
+                current_atr = float(atr_vals[-1])
+
+                # Monitor and potentially exit
+                updated_trade = await self.executor.monitor_and_manage_trade(
+                    trade=trade,
+                    current_price=current_price,
+                    current_atr=current_atr
+                )
+
+                # If trade closed
+                if updated_trade.status == TradeStatus.CLOSED:
+                    # Update capital
+                    self.current_capital += updated_trade.realized_pnl
+
+                    # Update risk manager P&L
+                    self.risk_manager.update_pnl(
+                        updated_trade, self.current_capital
+                    )
+
+                    # Record in performance engine
+                    self.performance.add_trade(updated_trade)
+
+                    # Update signal weights based on performance
+                    metrics = self.performance.calculate_metrics(
+                        period_days=7
+                    )
+                    if metrics.signal_ic:
+                        self.signal_engine.update_signal_weights(
+                            metrics.signal_ic
+                        )
+
+                    logger.info(
+                        f"💼 Capital updated: ${self.current_capital:.2f} | "
+                        f"Phase: {config.get_phase(self.current_capital)}"
+                    )
+
+            except Exception as e:
+                logger.error(
+                    f"Error monitoring trade {trade_id}: {e}"
+                )
+
+    async def _hourly_review(self) -> None:
+        """Quick hourly performance check"""
+        risk_report = self.risk_manager.get_risk_report(
+            self.current_capital
+        )
+
+        uptime = (datetime.now() - self.start_time)
+
+        logger.info(
+            f"\n{'─'*50}\n"
+            f"📊 HOURLY REVIEW\n"
+            f"   Capital:     ${self.current_capital:,.2f}\n"
+            f"   Daily P&L:   ${risk_report['daily_pnl']:+,.2f} "
+            f"({risk_report['daily_pnl_pct']:+.2%})\n"
+            f"   Drawdown:    {risk_report['current_drawdown']:.2%}\n"
+            f"   Win Rate:    {risk_report['edge_statistics']['win_rate']:.1%}\n"
+            f"   Risk of Ruin:{risk_report['risk_of_ruin']:.6%}\n"
+            f"   Phase:       {risk_report['phase']}\n"
+            f"   Uptime:      {str(uptime).split('.')[0]}\n"
+            f"{'─'*50}"
+        )
+
+    async def _weekly_review(self) -> None:
+        """Full weekly performance review"""
+        recent_trades = [
+            t for t in self.performance.all_trades
+            if (datetime.now() - t.entry_time).days <= 7
+        ]
+
+        report = self.performance.generate_weekly_report(
+            trades=recent_trades,
+            current_capital=self.current_capital
+        )
+
+        logger.info(report)
+
+        # Run Monte Carlo with current stats
+        mc = self.performance.run_monte_carlo(
+            starting_capital=self.current_capital
+        )
+
+        logger.info(
+            f"Monte Carlo ({mc['n_simulations']} sims):\n"
+            f"  Median outcome (100 trades): "
+            f"${mc['outcomes']['median']:,.2f}\n"
+            f"  Risk of ruin: {mc['risk_metrics']['probability_of_ruin']:.3%}\n"
+            f"  Verdict: {mc['verdict']}"
+        )
+
+    async def _validate_system(self) -> bool:
+        """
+        Validate entire system before trading.
+        Run Monte Carlo. Check all connections.
+        """
+        logger.info("🔍 Validating system...")
+
+        # Test API connection
+        try:
+            await self.client.get_server_time()
+            logger.info("✅ API connection verified")
+        except Exception as e:
+            logger.error(f"❌ API connection failed: {e}")
+            return False
+
+        # Test data collection
+        try:
+            test_data = await self.data_collector.fetch_ohlcv(
+                'BTCUSDT', '5m', limit=100
+            )
+            is_valid, msg = self.data_collector.validate_market_data(
+                test_data
+            )
+            if not is_valid:
+                logger.error(f"❌ Data validation failed: {msg}")
+                return False
+            logger.info("✅ Data collection verified")
+        except Exception as e:
+            logger.error(f"❌ Data collection failed: {e}")
+            return False
+
+        # Run Monte Carlo validation
+        mc = self.performance.run_monte_carlo(
+            starting_capital=self.current_capital
+        )
+        logger.info(f"Monte Carlo: {mc['verdict']}")
+
+        logger.info("✅ System validation complete")
+        return True
+
+    async def _wait_for_next_cycle(self, seconds: int) -> None:
+        """Wait for next cycle with interrupt support"""
+        try:
+            await asyncio.sleep(seconds)
+        except asyncio.CancelledError:
+            pass
+
+    def _handle_shutdown(self, signum, frame) -> None:
+        """Graceful shutdown handler"""
+        logger.info("⚡ Shutdown signal received...")
+        self.is_running = False
+
+    async def stop(self) -> None:
+        """Graceful system shutdown"""
+        logger.info("🔴 Shutting down trading engine...")
+        self.is_running = False
+
+        # Close all positions if configured
+        if not config.trading.PAPER_TRADING:
+            logger.info("Closing all open positions...")
+            for trade in list(self.executor.open_trades.values()):
+                data = await self.data_collector.fetch_ohlcv(
+                    trade.symbol, config.trading.TICK, limit=5
+                )
+                await self.executor.execute_full_exit(
+                    trade, data.current_price, "SYSTEM_SHUTDOWN"
+                )
+
+        # Final report
+        report = self.performance.generate_weekly_report(
+            trades=self.performance.all_trades,
+            current_capital=self.current_capital
+        )
+        logger.info(report)
+
+        if self.data_collector:
+            await self.data_collector.close()
+
+        if self.client:
+            await self.client.close_connection()
+
+        logger.info(
+            f"✅ System shutdown complete. "
+            f"Final capital: ${self.current_capital:.2f}"
+        )
+
